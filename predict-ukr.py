@@ -113,7 +113,7 @@ class TIFTileDataset(Dataset):
             'pre_image': pre_image,
             'pre_image_original': pre_image_original,
             'post_image_original': pre_image_original,
-            'tile_info': tile_info,
+            'tile_info': tile_info,  # Keep as dict, not wrapped in list
             'tile_idx': idx,
             'file_name': os.path.basename(self.tif_file_path)
         }
@@ -398,10 +398,20 @@ def ubdd_plusplus_tile_inference(
         # Process each tile
         with tqdm(tile_dataloader, desc="Processing tiles", leave=False) as tile_pbar:
             for batch in tile_pbar:
-                # Extract single item from batch
-                single_batch = {k: v[0] if isinstance(v, (list, tuple)) else v[0] 
-                              for k, v in batch.items() if k != 'tile_info'}
-                single_batch['tile_info'] = batch['tile_info'][0]
+                # Extract single item from batch - fix the batch processing
+                single_batch = {}
+                for k, v in batch.items():
+                    if k == 'tile_info':
+                        # tile_info is a list of dicts, extract the first dict
+                        single_batch[k] = v[0] if isinstance(v, list) and len(v) > 0 else v
+                    elif isinstance(v, (list, tuple)) and len(v) > 0:
+                        # For tensors and other data, get the first item
+                        single_batch[k] = v[0]
+                    elif hasattr(v, 'squeeze'):
+                        # For tensors, remove batch dimension
+                        single_batch[k] = v.squeeze(0)
+                    else:
+                        single_batch[k] = v
                 
                 # Process single tile
                 tile_result = process_single_tile(
