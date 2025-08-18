@@ -1,5 +1,5 @@
 """
-U-BDD++ Evaluation with pre-trained CLIP - Modified for UKR TIF tile-based inference
+U-BDD++ Evaluation with pre-trained CLIP - Modified for UKR TIF tile-based inference (512x512)
 """
 import argparse
 import torch
@@ -25,14 +25,14 @@ from models.dino.util import box_ops
 from utils.filters import preliminary_filter
 from utils.utils import pixel_f1_iou
 
-# Constants
-TILE_SIZE = 1024
+# Constants - Updated for 512x512 tiles
+TILE_SIZE = 512
 DINO_TEXT_PROMPT = "building"
 DAMAGE_DICT_BGR = [[0, 0, 0], [70, 172, 0], [0, 140, 253]]
 
 
 class TIFTileDataset(Dataset):
-    """Dataset class for TIF image tile-based inference"""
+    """Dataset class for TIF image tile-based inference with 512x512 tiles"""
     
     def __init__(self, tif_file_path, tile_size=TILE_SIZE, overlap=0):
         self.tif_file_path = tif_file_path
@@ -47,12 +47,12 @@ class TIFTileDataset(Dataset):
         except Exception as e:
             raise ValueError(f"Error loading TIF file {tif_file_path}: {e}")
         
-        # Calculate tile grid
+        # Calculate tile grid for 512x512 tiles
         self.tiles_x = math.ceil(self.original_width / (tile_size - overlap))
         self.tiles_y = math.ceil(self.original_height / (tile_size - overlap))
         self.total_tiles = self.tiles_x * self.tiles_y
         
-        print(f"Will create {self.tiles_x}x{self.tiles_y} = {self.total_tiles} tiles")
+        print(f"Will create {self.tiles_x}x{self.tiles_y} = {self.total_tiles} tiles of size {tile_size}x{tile_size}")
         
         # Create tile coordinates
         self.tile_coords = []
@@ -75,7 +75,7 @@ class TIFTileDataset(Dataset):
                     'height': end_y - start_y
                 })
         
-        # DINO transform
+        # DINO transform - updated for 512x512 input
         self.normalize = T.Compose([
             T.ToTensor(),
             T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
@@ -98,7 +98,7 @@ class TIFTileDataset(Dataset):
             tile_info['end_y']
         ))
         
-        # Pad tile to target size if needed
+        # Resize or pad tile to exactly 512x512
         if tile_image.size != (self.tile_size, self.tile_size):
             # Create a new image with black padding
             padded_image = Image.new('RGB', (self.tile_size, self.tile_size), color='black')
@@ -113,9 +113,10 @@ class TIFTileDataset(Dataset):
             'pre_image': pre_image,
             'pre_image_original': pre_image_original,
             'post_image_original': pre_image_original,
-            'tile_info': tile_info,  # Keep as dict, not wrapped in list
+            'tile_info': tile_info,
             'tile_idx': idx,
-            'file_name': os.path.basename(self.tif_file_path)
+            'file_name': os.path.basename(self.tif_file_path),
+            'original_tile_size': (tile_info['width'], tile_info['height'])
         }
     
     def get_image_info(self):
@@ -153,7 +154,7 @@ class TIFInferenceDataset(Dataset):
 
 
 def merge_tile_predictions(tile_results, image_info, output_path_base):
-    """Merge individual tile predictions into a single full-size prediction"""
+    """Merge individual tile predictions into a single full-size prediction - updated for 512x512 tiles"""
     
     # Initialize full-size prediction arrays
     full_width = image_info['width']
@@ -167,15 +168,22 @@ def merge_tile_predictions(tile_results, image_info, output_path_base):
         tile_info = tile_result['tile_info']
         pred_mask = tile_result['pred_mask']
         
-        # Extract the valid region of the tile (excluding padding)
-        valid_height = min(tile_info['height'], pred_mask.shape[0])
-        valid_width = min(tile_info['width'], pred_mask.shape[1])
+        # Get original tile dimensions
+        original_tile_width = tile_info['width']
+        original_tile_height = tile_info['height']
+        
+        # If the prediction mask is 512x512 but the original tile was smaller, 
+        # we need to crop the prediction to match the original tile size
+        if pred_mask.shape != (original_tile_height, original_tile_width):
+            pred_mask_cropped = pred_mask[:original_tile_height, :original_tile_width]
+        else:
+            pred_mask_cropped = pred_mask
         
         # Place tile prediction in the full image
         full_pred_mask[
-            tile_info['start_y']:tile_info['start_y'] + valid_height,
-            tile_info['start_x']:tile_info['start_x'] + valid_width
-        ] = pred_mask[:valid_height, :valid_width]
+            tile_info['start_y']:tile_info['start_y'] + original_tile_height,
+            tile_info['start_x']:tile_info['start_x'] + original_tile_width
+        ] = pred_mask_cropped
     
     # Create colored prediction mask
     color_mask = np.zeros((full_height, full_width, 3), dtype=np.uint8)
@@ -246,7 +254,7 @@ def process_single_tile(
     dino_threshold,
     device
 ):
-    """Process a single tile and return prediction results"""
+    """Process a single 512x512 tile and return prediction results"""
     
     # Get DINO predictions
     output = get_dino_output(
@@ -260,7 +268,7 @@ def process_single_tile(
     logits = output["scores"].detach().cpu()
     phrases = output["labels"]
     
-    # Convert boxes to xyxy format
+    # Convert boxes to xyxy format (scale by 512 for 512x512 tiles)
     boxes = box_convert(boxes * TILE_SIZE, "cxcywh", "xyxy")
     
     # SAM prediction for all bounding boxes
@@ -299,7 +307,7 @@ def process_single_tile(
             w = x2 - x1
             h = y2 - y1
             
-            # Apply the image buffer
+            # Apply the image buffer (adjusted for 512x512 tiles)
             image_buffer_x = (
                 (clip_min_patch_size - w) / 2.0
                 if w < clip_min_patch_size
@@ -362,7 +370,7 @@ def process_single_tile(
     }
 
 
-# Modified inference function for tile-based processing
+# Updated inference function for 512x512 tile-based processing
 def ubdd_plusplus_tile_inference(
     dino_model,
     dino_postprocessors,
@@ -378,7 +386,7 @@ def ubdd_plusplus_tile_inference(
     device,
     output_dir
 ):
-    """Run tile-based inference on TIF images and save results"""
+    """Run 512x512 tile-based inference on TIF images and save results"""
     
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -388,7 +396,7 @@ def ubdd_plusplus_tile_inference(
     for tif_file in tqdm(tif_files, desc="Processing TIF files"):
         print(f"\nProcessing: {os.path.basename(tif_file)}")
         
-        # Create tile dataset for this TIF file
+        # Create tile dataset for this TIF file (512x512 tiles)
         tile_dataset = TIFTileDataset(tif_file, tile_size=TILE_SIZE)
         tile_dataloader = DataLoader(tile_dataset, batch_size=1, shuffle=False, num_workers=0)
         
@@ -396,9 +404,9 @@ def ubdd_plusplus_tile_inference(
         tile_results = []
         
         # Process each tile
-        with tqdm(tile_dataloader, desc="Processing tiles", leave=False) as tile_pbar:
+        with tqdm(tile_dataloader, desc="Processing 512x512 tiles", leave=False) as tile_pbar:
             for batch in tile_pbar:
-                # Extract single item from batch - fix the batch processing
+                # Extract single item from batch
                 single_batch = {}
                 for k, v in batch.items():
                     if k == 'tile_info':
@@ -440,7 +448,7 @@ def ubdd_plusplus_tile_inference(
         base_name = os.path.splitext(os.path.basename(tif_file))[0]
         output_path_base = os.path.join(output_dir, base_name)
         
-        print(f"Merging {len(tile_results)} tiles...")
+        print(f"Merging {len(tile_results)} 512x512 tiles...")
         full_pred_mask, color_mask = merge_tile_predictions(
             tile_results, image_info, output_path_base
         )
@@ -462,6 +470,7 @@ def ubdd_plusplus_tile_inference(
         result = {
             'file_name': os.path.basename(tif_file),
             'image_size': f"{image_info['width']}x{image_info['height']}",
+            'tile_size': f"{TILE_SIZE}x{TILE_SIZE}",
             'num_tiles': len(tile_results),
             'total_detections': total_detections,
             'total_damaged_pixels': int(total_damaged),
@@ -477,26 +486,27 @@ def ubdd_plusplus_tile_inference(
               f"{total_undamaged} undamaged pixels")
     
     # Save summary results
-    summary_path = os.path.join(output_dir, "tile_inference_summary.txt")
+    summary_path = os.path.join(output_dir, "tile_inference_summary_512.txt")
     with open(summary_path, 'w') as f:
-        f.write("TIF Tile-based Inference Summary\n")
-        f.write("================================\n\n")
+        f.write("TIF 512x512 Tile-based Inference Summary\n")
+        f.write("========================================\n\n")
         for result in all_results:
             f.write(f"File: {result['file_name']}\n")
             f.write(f"  Image size: {result['image_size']}\n")
+            f.write(f"  Tile size: {result['tile_size']}\n")
             f.write(f"  Number of tiles: {result['num_tiles']}\n")
             f.write(f"  Total detections: {result['total_detections']}\n")
             f.write(f"  Damaged pixels: {result['total_damaged_pixels']}\n")
             f.write(f"  Undamaged pixels: {result['total_undamaged_pixels']}\n")
             f.write(f"  Damage percentage: {result['damage_percentage']:.2f}%\n\n")
     
-    print(f"\nTile-based inference completed! Results saved to: {output_dir}")
+    print(f"\n512x512 tile-based inference completed! Results saved to: {output_dir}")
     print(f"Processed {len(all_results)} TIF images")
     return all_results
 
 
 def get_args():
-    parser = argparse.ArgumentParser(description="TIF Image Tile-based Inference with U-BDD++")
+    parser = argparse.ArgumentParser(description="TIF Image 512x512 Tile-based Inference with U-BDD++")
     parser.add_argument(
         "--tif-folder-path",
         "-tfp",
@@ -509,7 +519,7 @@ def get_args():
         "--output-dir",
         "-od",
         type=str,
-        default="outputs/tif_tile_inference",
+        default="outputs/tif_tile_inference_512",
         help="Output directory for results",
         dest="output_dir",
     )
@@ -572,8 +582,8 @@ def get_args():
         "--tile-size",
         "-ts",
         type=int,
-        default=1024,
-        help="Size of tiles for processing",
+        default=512,
+        help="Size of tiles for processing (default: 512)",
         dest="tile_size",
     )
     return parser.parse_args()
@@ -589,6 +599,10 @@ def main():
     print(f"TIF folder: {args.tif_folder_path}")
     print(f"Output directory: {args.output_dir}")
     print(f"Tile size: {args.tile_size}x{args.tile_size}")
+
+    # Update global tile size if provided
+    global TILE_SIZE
+    TILE_SIZE = args.tile_size
 
     # Load models
     print("Loading DINO model...")
@@ -610,7 +624,7 @@ def main():
     tif_files = [inference_dataset[i] for i in range(len(inference_dataset))]
 
     # Run tile-based inference
-    print("Starting tile-based inference...")
+    print(f"Starting {args.tile_size}x{args.tile_size} tile-based inference...")
     results = ubdd_plusplus_tile_inference(
         dino_model,
         postprocessors,
