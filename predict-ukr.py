@@ -1,5 +1,5 @@
 """
-U-BDD++ Evaluation with pre-trained CLIP - Modified for UKR TIF tile-based inference (512x512)
+U-BDD++ Evaluation with pre-trained CLIP - Modified for UKR TIF tile-based inference (256x256)
 """
 import argparse
 import torch
@@ -25,19 +25,19 @@ from models.dino.util import box_ops
 from utils.filters import preliminary_filter
 from utils.utils import pixel_f1_iou
 
-# Constants - Updated for 512x512 tiles
-TILE_SIZE = 512
+# Constants - Updated for 256x256 tiles
+TILE_SIZE = 256
 DINO_TEXT_PROMPT = "building"
 DAMAGE_DICT_BGR = [[0, 0, 0], [70, 172, 0], [0, 140, 253]]
 
 
 class TIFTileDataset(Dataset):
-    """Dataset class for TIF image tile-based inference with 512x512 tiles"""
+    """Dataset class for TIF image tile-based inference with 256x256 tiles"""
     
-    def __init__(self, tif_file_path, tile_size=TILE_SIZE, overlap=0):
+    def __init__(self, tif_file_path, tile_size=TILE_SIZE, overlap=32):
         self.tif_file_path = tif_file_path
         self.tile_size = tile_size
-        self.overlap = overlap
+        self.overlap = overlap  # Increased overlap for better edge handling with smaller tiles
         
         # Load the full TIF image
         try:
@@ -47,20 +47,35 @@ class TIFTileDataset(Dataset):
         except Exception as e:
             raise ValueError(f"Error loading TIF file {tif_file_path}: {e}")
         
-        # Calculate tile grid for 512x512 tiles
-        self.tiles_x = math.ceil(self.original_width / (tile_size - overlap))
-        self.tiles_y = math.ceil(self.original_height / (tile_size - overlap))
+        # Calculate tile grid for 256x256 tiles with overlap
+        step_size = tile_size - overlap
+        self.tiles_x = max(1, math.ceil((self.original_width - overlap) / step_size))
+        self.tiles_y = max(1, math.ceil((self.original_height - overlap) / step_size))
         self.total_tiles = self.tiles_x * self.tiles_y
         
-        print(f"Will create {self.tiles_x}x{self.tiles_y} = {self.total_tiles} tiles of size {tile_size}x{tile_size}")
+        print(f"Will create {self.tiles_x}x{self.tiles_y} = {self.total_tiles} tiles of size {tile_size}x{tile_size} (overlap: {overlap}px)")
         
         # Create tile coordinates
         self.tile_coords = []
         for y in range(self.tiles_y):
             for x in range(self.tiles_x):
                 # Calculate tile boundaries
-                start_x = x * (tile_size - overlap)
-                start_y = y * (tile_size - overlap)
+                start_x = x * step_size
+                start_y = y * step_size
+                end_x = min(start_x + tile_size, self.original_width)
+                end_y = min(start_y + tile_size, self.original_height)
+                
+                # Ensure we don't go below 0
+                start_x = max(0, start_x)
+                start_y = max(0, start_y)
+                
+                # For edge tiles, adjust to get full tile size when possible
+                if end_x - start_x < tile_size and start_x > 0:
+                    start_x = max(0, end_x - tile_size)
+                if end_y - start_y < tile_size and start_y > 0:
+                    start_y = max(0, end_y - tile_size)
+                    
+                # Recalculate end coordinates
                 end_x = min(start_x + tile_size, self.original_width)
                 end_y = min(start_y + tile_size, self.original_height)
                 
@@ -75,14 +90,18 @@ class TIFTileDataset(Dataset):
                     'height': end_y - start_y
                 })
         
-        # DINO transform - updated for 512x512 input
+        # DINO transform - resize to 256x256 for consistent processing
         self.normalize = T.Compose([
+            T.Resize((256, 256), interpolation=T.InterpolationMode.BILINEAR),
             T.ToTensor(),
             T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
         
-        # Transform for original image (without normalization)
-        self.to_tensor = T.ToTensor()
+        # Transform for original image (without normalization but with resize)
+        self.to_tensor = T.Compose([
+            T.Resize((256, 256), interpolation=T.InterpolationMode.BILINEAR),
+            T.ToTensor()
+        ])
     
     def __len__(self):
         return self.total_tiles
@@ -98,16 +117,15 @@ class TIFTileDataset(Dataset):
             tile_info['end_y']
         ))
         
-        # Resize or pad tile to exactly 512x512
-        if tile_image.size != (self.tile_size, self.tile_size):
-            # Create a new image with black padding
-            padded_image = Image.new('RGB', (self.tile_size, self.tile_size), color='black')
-            padded_image.paste(tile_image, (0, 0))
-            tile_image = padded_image
+        # Store original tile size before resizing
+        original_tile_size = tile_image.size
+        
+        # Resize tile to exactly 256x256 for processing
+        tile_image_resized = tile_image.resize((self.tile_size, self.tile_size), Image.Resampling.BILINEAR)
         
         # Apply transforms
-        pre_image = self.normalize(tile_image)
-        pre_image_original = self.to_tensor(tile_image)
+        pre_image = self.normalize(tile_image_resized)
+        pre_image_original = self.to_tensor(tile_image_resized)
         
         return {
             'pre_image': pre_image,
@@ -116,7 +134,7 @@ class TIFTileDataset(Dataset):
             'tile_info': tile_info,
             'tile_idx': idx,
             'file_name': os.path.basename(self.tif_file_path),
-            'original_tile_size': (tile_info['width'], tile_info['height'])
+            'original_tile_size': original_tile_size
         }
     
     def get_image_info(self):
@@ -127,7 +145,8 @@ class TIFTileDataset(Dataset):
             'tiles_x': self.tiles_x,
             'tiles_y': self.tiles_y,
             'total_tiles': self.total_tiles,
-            'tile_size': self.tile_size
+            'tile_size': self.tile_size,
+            'overlap': self.overlap
         }
 
 
@@ -153,37 +172,79 @@ class TIFInferenceDataset(Dataset):
         return self.tif_files[idx]
 
 
-def merge_tile_predictions(tile_results, image_info, output_path_base):
-    """Merge individual tile predictions into a single full-size prediction - updated for 512x512 tiles"""
+def merge_tile_predictions_with_overlap(tile_results, image_info, output_path_base):
+    """Merge individual tile predictions with overlap handling - optimized for 256x256 tiles"""
     
     # Initialize full-size prediction arrays
     full_width = image_info['width']
     full_height = image_info['height']
+    overlap = image_info.get('overlap', 0)
     
-    # Create full-size prediction mask
-    full_pred_mask = np.zeros((full_height, full_width), dtype=np.uint8)
+    # Create full-size prediction mask and weight mask for overlap handling
+    full_pred_mask = np.zeros((full_height, full_width), dtype=np.float32)
+    weight_mask = np.zeros((full_height, full_width), dtype=np.float32)
     
     # Process each tile result
     for tile_result in tile_results:
         tile_info = tile_result['tile_info']
-        pred_mask = tile_result['pred_mask']
+        pred_mask = tile_result['pred_mask'].astype(np.float32)
         
         # Get original tile dimensions
         original_tile_width = tile_info['width']
         original_tile_height = tile_info['height']
         
-        # If the prediction mask is 512x512 but the original tile was smaller, 
-        # we need to crop the prediction to match the original tile size
+        # Resize prediction mask back to original tile size
         if pred_mask.shape != (original_tile_height, original_tile_width):
-            pred_mask_cropped = pred_mask[:original_tile_height, :original_tile_width]
+            pred_mask_resized = cv2.resize(
+                pred_mask, 
+                (original_tile_width, original_tile_height), 
+                interpolation=cv2.INTER_NEAREST  # Use nearest neighbor to preserve class labels
+            )
         else:
-            pred_mask_cropped = pred_mask
+            pred_mask_resized = pred_mask
         
-        # Place tile prediction in the full image
-        full_pred_mask[
-            tile_info['start_y']:tile_info['start_y'] + original_tile_height,
-            tile_info['start_x']:tile_info['start_x'] + original_tile_width
-        ] = pred_mask_cropped
+        # Create weight map for this tile (higher weight in center, lower at edges for overlap)
+        tile_weight = np.ones((original_tile_height, original_tile_width), dtype=np.float32)
+        
+        if overlap > 0:
+            # Create distance-based weights (higher in center, lower at edges)
+            y_indices, x_indices = np.meshgrid(
+                np.arange(original_tile_height), 
+                np.arange(original_tile_width), 
+                indexing='ij'
+            )
+            
+            # Distance from edges
+            dist_from_left = x_indices
+            dist_from_right = original_tile_width - 1 - x_indices
+            dist_from_top = y_indices
+            dist_from_bottom = original_tile_height - 1 - y_indices
+            
+            # Minimum distance from any edge
+            edge_distance = np.minimum(
+                np.minimum(dist_from_left, dist_from_right),
+                np.minimum(dist_from_top, dist_from_bottom)
+            )
+            
+            # Weight based on distance from edge (within overlap region)
+            overlap_factor = min(overlap // 2, min(original_tile_height, original_tile_width) // 4)
+            if overlap_factor > 0:
+                tile_weight = np.minimum(1.0, edge_distance / overlap_factor)
+        
+        # Place tile prediction in the full image with weighted averaging
+        start_y, start_x = tile_info['start_y'], tile_info['start_x']
+        end_y, end_x = start_y + original_tile_height, start_x + original_tile_width
+        
+        # Accumulate weighted predictions
+        full_pred_mask[start_y:end_y, start_x:end_x] += pred_mask_resized * tile_weight
+        weight_mask[start_y:end_y, start_x:end_x] += tile_weight
+    
+    # Normalize by weights to get final prediction
+    weight_mask[weight_mask == 0] = 1  # Avoid division by zero
+    full_pred_mask = full_pred_mask / weight_mask
+    
+    # Round to nearest integer class
+    full_pred_mask = np.round(full_pred_mask).astype(np.uint8)
     
     # Create colored prediction mask
     color_mask = np.zeros((full_height, full_width, 3), dtype=np.uint8)
@@ -254,7 +315,7 @@ def process_single_tile(
     dino_threshold,
     device
 ):
-    """Process a single 512x512 tile and return prediction results"""
+    """Process a single 256x256 tile and return prediction results"""
     
     # Get DINO predictions
     output = get_dino_output(
@@ -268,7 +329,7 @@ def process_single_tile(
     logits = output["scores"].detach().cpu()
     phrases = output["labels"]
     
-    # Convert boxes to xyxy format (scale by 512 for 512x512 tiles)
+    # Convert boxes to xyxy format (scale by 256 for 256x256 tiles)
     boxes = box_convert(boxes * TILE_SIZE, "cxcywh", "xyxy")
     
     # SAM prediction for all bounding boxes
@@ -299,7 +360,7 @@ def process_single_tile(
                 multimask_output=False,
             )
         
-        # CLIP Prediction for each bounding box
+        # CLIP Prediction for each bounding box (adjusted for 256x256 tiles)
         predictions = []
         for bbox in boxes.tolist():
             # Crop out the image given bboxes
@@ -307,16 +368,20 @@ def process_single_tile(
             w = x2 - x1
             h = y2 - y1
             
-            # Apply the image buffer (adjusted for 512x512 tiles)
+            # Apply the image buffer (adjusted for 256x256 tiles)
+            # Use smaller minimum patch size for smaller tiles
+            adjusted_min_patch_size = max(50, clip_min_patch_size // 2)
+            adjusted_padding = max(5, clip_img_padding // 2)
+            
             image_buffer_x = (
-                (clip_min_patch_size - w) / 2.0
-                if w < clip_min_patch_size
-                else clip_img_padding
+                (adjusted_min_patch_size - w) / 2.0
+                if w < adjusted_min_patch_size
+                else adjusted_padding
             )
             image_buffer_y = (
-                (clip_min_patch_size - h) / 2.0
-                if h < clip_min_patch_size
-                else clip_img_padding
+                (adjusted_min_patch_size - h) / 2.0
+                if h < adjusted_min_patch_size
+                else adjusted_padding
             )
             
             # Add padding for prediction
@@ -325,23 +390,28 @@ def process_single_tile(
             x2_pad = min(int(x2 + image_buffer_x), TILE_SIZE)
             y2_pad = min(int(y2 + image_buffer_y), TILE_SIZE)
             
-            pre_building_patch = T.ToPILImage()(
-                batch["pre_image_original"][:, y1_pad:y2_pad, x1_pad:x2_pad]
-            )
-            pre_building_patch_clip = (
-                clip_preprocess(pre_building_patch).unsqueeze(0).to(device)
-            )
-            
-            # For TIF inference, use the same image for both pre and post
-            post_building_patch_clip = pre_building_patch_clip
-            
-            pred = clip_prediction_ensemble(
-                clip_model,
-                pre_building_patch_clip,
-                post_building_patch_clip,
-                clip_text,
-            )
-            predictions.append(pred + 1)
+            # Ensure we have a valid patch
+            if x2_pad > x1_pad and y2_pad > y1_pad:
+                pre_building_patch = T.ToPILImage()(
+                    batch["pre_image_original"][:, y1_pad:y2_pad, x1_pad:x2_pad]
+                )
+                pre_building_patch_clip = (
+                    clip_preprocess(pre_building_patch).unsqueeze(0).to(device)
+                )
+                
+                # For TIF inference, use the same image for both pre and post
+                post_building_patch_clip = pre_building_patch_clip
+                
+                pred = clip_prediction_ensemble(
+                    clip_model,
+                    pre_building_patch_clip,
+                    post_building_patch_clip,
+                    clip_text,
+                )
+                predictions.append(pred + 1)
+            else:
+                # If patch is too small, default to undamaged
+                predictions.append(1)
     
     # Create prediction mask
     if len(predictions) == 0:
@@ -370,7 +440,7 @@ def process_single_tile(
     }
 
 
-# Updated inference function for 512x512 tile-based processing
+# Updated inference function for 256x256 tile-based processing
 def ubdd_plusplus_tile_inference(
     dino_model,
     dino_postprocessors,
@@ -386,7 +456,7 @@ def ubdd_plusplus_tile_inference(
     device,
     output_dir
 ):
-    """Run 512x512 tile-based inference on TIF images and save results"""
+    """Run 256x256 tile-based inference on TIF images and save results"""
     
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -396,7 +466,7 @@ def ubdd_plusplus_tile_inference(
     for tif_file in tqdm(tif_files, desc="Processing TIF files"):
         print(f"\nProcessing: {os.path.basename(tif_file)}")
         
-        # Create tile dataset for this TIF file (512x512 tiles)
+        # Create tile dataset for this TIF file (256x256 tiles)
         tile_dataset = TIFTileDataset(tif_file, tile_size=TILE_SIZE)
         tile_dataloader = DataLoader(tile_dataset, batch_size=1, shuffle=False, num_workers=0)
         
@@ -404,7 +474,7 @@ def ubdd_plusplus_tile_inference(
         tile_results = []
         
         # Process each tile
-        with tqdm(tile_dataloader, desc="Processing 512x512 tiles", leave=False) as tile_pbar:
+        with tqdm(tile_dataloader, desc="Processing 256x256 tiles", leave=False) as tile_pbar:
             for batch in tile_pbar:
                 # Extract single item from batch
                 single_batch = {}
@@ -444,12 +514,12 @@ def ubdd_plusplus_tile_inference(
                     refresh=False
                 )
         
-        # Merge tiles into full image
+        # Merge tiles into full image with overlap handling
         base_name = os.path.splitext(os.path.basename(tif_file))[0]
         output_path_base = os.path.join(output_dir, base_name)
         
-        print(f"Merging {len(tile_results)} 512x512 tiles...")
-        full_pred_mask, color_mask = merge_tile_predictions(
+        print(f"Merging {len(tile_results)} 256x256 tiles with overlap handling...")
+        full_pred_mask, color_mask = merge_tile_predictions_with_overlap(
             tile_results, image_info, output_path_base
         )
         
@@ -472,6 +542,7 @@ def ubdd_plusplus_tile_inference(
             'image_size': f"{image_info['width']}x{image_info['height']}",
             'tile_size': f"{TILE_SIZE}x{TILE_SIZE}",
             'num_tiles': len(tile_results),
+            'overlap': image_info['overlap'],
             'total_detections': total_detections,
             'total_damaged_pixels': int(total_damaged),
             'total_undamaged_pixels': int(total_undamaged),
@@ -486,27 +557,28 @@ def ubdd_plusplus_tile_inference(
               f"{total_undamaged} undamaged pixels")
     
     # Save summary results
-    summary_path = os.path.join(output_dir, "tile_inference_summary_512.txt")
+    summary_path = os.path.join(output_dir, "tile_inference_summary_256.txt")
     with open(summary_path, 'w') as f:
-        f.write("TIF 512x512 Tile-based Inference Summary\n")
+        f.write("TIF 256x256 Tile-based Inference Summary\n")
         f.write("========================================\n\n")
         for result in all_results:
             f.write(f"File: {result['file_name']}\n")
             f.write(f"  Image size: {result['image_size']}\n")
             f.write(f"  Tile size: {result['tile_size']}\n")
+            f.write(f"  Overlap: {result['overlap']}px\n")
             f.write(f"  Number of tiles: {result['num_tiles']}\n")
             f.write(f"  Total detections: {result['total_detections']}\n")
             f.write(f"  Damaged pixels: {result['total_damaged_pixels']}\n")
             f.write(f"  Undamaged pixels: {result['total_undamaged_pixels']}\n")
             f.write(f"  Damage percentage: {result['damage_percentage']:.2f}%\n\n")
     
-    print(f"\n512x512 tile-based inference completed! Results saved to: {output_dir}")
+    print(f"\n256x256 tile-based inference completed! Results saved to: {output_dir}")
     print(f"Processed {len(all_results)} TIF images")
     return all_results
 
 
 def get_args():
-    parser = argparse.ArgumentParser(description="TIF Image 512x512 Tile-based Inference with U-BDD++")
+    parser = argparse.ArgumentParser(description="TIF Image 256x256 Tile-based Inference with U-BDD++")
     parser.add_argument(
         "--tif-folder-path",
         "-tfp",
@@ -519,7 +591,7 @@ def get_args():
         "--output-dir",
         "-od",
         type=str,
-        default="outputs/tif_tile_inference_512",
+        default="outputs/tif_tile_inference_256",
         help="Output directory for results",
         dest="output_dir",
     )
@@ -527,7 +599,7 @@ def get_args():
         "--clip-min-patch-size",
         "-cmps",
         type=int,
-        default=100,
+        default=50,  # Reduced for smaller tiles
         help="Minimum patch size for CLIP",
         dest="clip_min_patch_size",
     )
@@ -535,7 +607,7 @@ def get_args():
         "--clip-img-padding",
         "-cip",
         type=int,
-        default=10,
+        default=5,  # Reduced for smaller tiles
         help="Padding of patch for CLIP",
         dest="clip_img_padding",
     )
@@ -582,9 +654,17 @@ def get_args():
         "--tile-size",
         "-ts",
         type=int,
-        default=512,
-        help="Size of tiles for processing (default: 512)",
+        default=256,
+        help="Size of tiles for processing (default: 256)",
         dest="tile_size",
+    )
+    parser.add_argument(
+        "--overlap",
+        "-ov",
+        type=int,
+        default=32,
+        help="Overlap between tiles in pixels (default: 32)",
+        dest="overlap",
     )
     return parser.parse_args()
 
@@ -599,6 +679,7 @@ def main():
     print(f"TIF folder: {args.tif_folder_path}")
     print(f"Output directory: {args.output_dir}")
     print(f"Tile size: {args.tile_size}x{args.tile_size}")
+    print(f"Tile overlap: {args.overlap}px")
 
     # Update global tile size if provided
     global TILE_SIZE
