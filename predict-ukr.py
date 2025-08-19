@@ -187,7 +187,12 @@ def merge_tile_predictions_with_overlap(tile_results, image_info, output_path_ba
     # Process each tile result
     for tile_result in tile_results:
         tile_info = tile_result['tile_info']
-        pred_mask = tile_result['pred_mask'].astype(np.float32)
+        pred_mask = tile_result['pred_mask']
+        
+        # Convert to numpy array if it's a tensor and ensure float32 type
+        if hasattr(pred_mask, 'cpu'):
+            pred_mask = pred_mask.cpu().numpy()
+        pred_mask = pred_mask.astype(np.float32)
         
         # Get original tile dimensions
         original_tile_width = tile_info['width']
@@ -215,10 +220,10 @@ def merge_tile_predictions_with_overlap(tile_results, image_info, output_path_ba
             )
             
             # Distance from edges
-            dist_from_left = x_indices
-            dist_from_right = original_tile_width - 1 - x_indices
-            dist_from_top = y_indices
-            dist_from_bottom = original_tile_height - 1 - y_indices
+            dist_from_left = x_indices.astype(np.float32)
+            dist_from_right = (original_tile_width - 1 - x_indices).astype(np.float32)
+            dist_from_top = y_indices.astype(np.float32)
+            dist_from_bottom = (original_tile_height - 1 - y_indices).astype(np.float32)
             
             # Minimum distance from any edge
             edge_distance = np.minimum(
@@ -231,11 +236,28 @@ def merge_tile_predictions_with_overlap(tile_results, image_info, output_path_ba
             if overlap_factor > 0:
                 tile_weight = np.minimum(1.0, edge_distance / overlap_factor)
         
+        # Ensure tile_weight is numpy array with correct dtype
+        tile_weight = tile_weight.astype(np.float32)
+        
         # Place tile prediction in the full image with weighted averaging
         start_y, start_x = tile_info['start_y'], tile_info['start_x']
         end_y, end_x = start_y + original_tile_height, start_x + original_tile_width
         
-        # Accumulate weighted predictions
+        # Ensure indices are within bounds
+        start_y = max(0, start_y)
+        start_x = max(0, start_x)
+        end_y = min(full_height, end_y)
+        end_x = min(full_width, end_x)
+        
+        # Adjust tile data if needed for boundary cases
+        actual_height = end_y - start_y
+        actual_width = end_x - start_x
+        
+        if actual_height != original_tile_height or actual_width != original_tile_width:
+            pred_mask_resized = pred_mask_resized[:actual_height, :actual_width]
+            tile_weight = tile_weight[:actual_height, :actual_width]
+        
+        # Accumulate weighted predictions (all numpy operations)
         full_pred_mask[start_y:end_y, start_x:end_x] += pred_mask_resized * tile_weight
         weight_mask[start_y:end_y, start_x:end_x] += tile_weight
     
@@ -428,11 +450,14 @@ def process_single_tile(
             .squeeze(0)
         )
     
+    # Convert prediction mask to numpy array
+    pred_mask_np = pred_mask.cpu().numpy()
+    
     return {
-        'pred_mask': pred_mask.cpu().numpy(),
+        'pred_mask': pred_mask_np,  # Ensure this is always a NumPy array
         'num_detections': len(boxes),
-        'num_damaged': (pred_mask.cpu().numpy() == 2).sum(),
-        'num_undamaged': (pred_mask.cpu().numpy() == 1).sum(),
+        'num_damaged': (pred_mask_np == 2).sum(),
+        'num_undamaged': (pred_mask_np == 1).sum(),
         'boxes': boxes.tolist(),
         'scores': logits.tolist(),
         'predictions': predictions,
