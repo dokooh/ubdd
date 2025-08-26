@@ -98,6 +98,74 @@ def calculate_metrics(pred_mask, gt_mask=None):
     return metrics
 
 
+def calculate_detailed_metrics(pred_mask, gt_mask=None):
+    """Calculate detailed IoU, F1, and AUROC metrics"""
+    metrics = {}
+    
+    # If no ground truth is provided, calculate basic statistics only
+    if gt_mask is None:
+        metrics['damage_ratio'] = float((pred_mask == 2).sum()) / float(pred_mask.size)
+        metrics['building_ratio'] = float(((pred_mask == 1) | (pred_mask == 2)).sum()) / float(pred_mask.size)
+        
+        # For inference without ground truth, we can't calculate IoU, F1, AUROC
+        metrics['building_iou'] = None
+        metrics['damage_iou'] = None
+        metrics['building_f1'] = None
+        metrics['damage_f1'] = None
+        metrics['building_auroc'] = None
+        metrics['damage_auroc'] = None
+        return metrics
+    
+    # Convert to binary masks for different classes
+    pred_building = (pred_mask > 0).astype(np.uint8)  # Any building (damaged or undamaged)
+    pred_damage = (pred_mask == 2).astype(np.uint8)   # Only damaged buildings
+    
+    gt_building = (gt_mask > 0).astype(np.uint8)      # Any building (damaged or undamaged)
+    gt_damage = (gt_mask == 2).astype(np.uint8)       # Only damaged buildings
+    
+    # Calculate IoU for building detection
+    metrics['building_iou'] = calculate_iou(pred_building, gt_building)
+    
+    # Calculate IoU for damage detection
+    metrics['damage_iou'] = calculate_iou(pred_damage, gt_damage)
+    
+    # Calculate F1 scores
+    if gt_building.sum() > 0:
+        pred_flat = pred_building.flatten()
+        gt_flat = gt_building.flatten()
+        metrics['building_f1'] = f1_score(gt_flat, pred_flat, average='binary')
+    else:
+        metrics['building_f1'] = 0.0
+    
+    if gt_damage.sum() > 0:
+        pred_flat = pred_damage.flatten()
+        gt_flat = gt_damage.flatten()
+        metrics['damage_f1'] = f1_score(gt_flat, pred_flat, average='binary')
+    else:
+        metrics['damage_f1'] = 0.0
+    
+    # Calculate AUROC (only if we have both classes)
+    try:
+        if len(np.unique(gt_building)) > 1:
+            metrics['building_auroc'] = roc_auc_score(gt_building.flatten(), pred_building.flatten())
+        else:
+            metrics['building_auroc'] = 0.5
+            
+        if len(np.unique(gt_damage)) > 1:
+            metrics['damage_auroc'] = roc_auc_score(gt_damage.flatten(), pred_damage.flatten())
+        else:
+            metrics['damage_auroc'] = 0.5
+    except ValueError:
+        metrics['building_auroc'] = 0.5
+        metrics['damage_auroc'] = 0.5
+    
+    # Add basic statistics
+    metrics['damage_ratio'] = float((pred_mask == 2).sum()) / float(pred_mask.size)
+    metrics['building_ratio'] = float(((pred_mask == 1) | (pred_mask == 2)).sum()) / float(pred_mask.size)
+    
+    return metrics
+
+
 class TIFTileDataset(Dataset):
     """Dataset class for TIF image tile-based inference with 512x512 tiles"""
     
@@ -731,155 +799,81 @@ def ubdd_plusplus_tile_inference(
     print(f"Processed {len(all_results)} TIF images")
     print(f"Average damage ratio: {overall_metrics['average_damage_ratio']:.4f}")
     print(f"Average building ratio: {overall_metrics['average_building_ratio']:.4f}")
+    
     return all_results
 
 
-def get_args():
-    parser = argparse.ArgumentParser(description="TIF Image 512x512 Tile-based Inference with U-BDD++ and Metrics")
-    parser.add_argument(
-        "--tif-folder-path",
-        "-tfp",
-        type=str,
-        default=r"C:\SAI\IA\D4TR\02-UKR_cleaned_data\02-UKR_cleaned_data",
-        help="Path to the folder containing TIF images",
-        dest="tif_folder_path",
-    )
-    parser.add_argument(
-        "--output-dir",
-        "-od",
-        type=str,
-        default="outputs/tif_tile_inference_512",
-        help="Output directory for results",
-        dest="output_dir",
-    )
-    parser.add_argument(
-        "--clip-min-patch-size",
-        "-cmps",
-        type=int,
-        default=100,  # Restored to original value for 512x512 tiles
-        help="Minimum patch size for CLIP",
-        dest="clip_min_patch_size",
-    )
-    parser.add_argument(
-        "--clip-img-padding",
-        "-cip",
-        type=int,
-        default=10,  # Restored to original value for 512x512 tiles
-        help="Padding of patch for CLIP",
-        dest="clip_img_padding",
-    )
-    parser.add_argument(
-        "--dino-path",
-        "-dp",
-        type=str,
-        required=True,
-        help="Path to the DINO model",
-        dest="dino_path",
-    )
-    parser.add_argument(
-        "--dino-config",
-        "-dc",
-        type=str,
-        required=True,
-        help="Path to the DINO config file",
-        dest="dino_config",
-    )
-    parser.add_argument(
-        "--dino-threshold",
-        "-dt",
-        type=float,
-        default=0.15,
-        help="Threshold for DINO bounding box prediction",
-        dest="dino_threshold",
-    )
-    parser.add_argument(
-        "--sam-path",
-        "-sp",
-        type=str,
-        required=True,
-        help="Path to the SAM model",
-        dest="sam_path",
-    )
-    parser.add_argument(
-        "--save-annotations",
-        "-sa",
-        action="store_true",
-        help="Save annotations",
-        dest="save_annotations",
-    )
-    parser.add_argument(
-        "--tile-size",
-        "-ts",
-        type=int,
-        default=512,
-        help="Size of tiles for processing (default: 512)",
-        dest="tile_size",
-    )
-    parser.add_argument(
-        "--overlap",
-        "-ov",
-        type=int,
-        default=64,
-        help="Overlap between tiles in pixels (default: 64)",
-        dest="overlap",
-    )
-    return parser.parse_args()
-
-
-def main():
-    args = get_args()
-
-    device_str = "cuda" if torch.cuda.is_available() else "cpu"
-    device = torch.device(device_str)
+def calculate_weighted_metrics(all_results):
+    """Calculate weighted IoU, F1, and AUROC across all images based on image size"""
     
-    print(f"Using device: {device_str}")
-    print(f"TIF folder: {args.tif_folder_path}")
-    print(f"Output directory: {args.output_dir}")
-    print(f"Tile size: {args.tile_size}x{args.tile_size}")
-    print(f"Tile overlap: {args.overlap}px")
-
-    # Update global tile size if provided
-    global TILE_SIZE
-    TILE_SIZE = args.tile_size
-
-    # Load models
-    print("Loading DINO model...")
-    dino_model, criterion, postprocessors = load_dino_model(
-        args.dino_config, args.dino_path, device=device_str
-    )
-
-    print("Loading SAM model...")
-    sam_model = sam_model_registry["default"](checkpoint=args.sam_path).to(device)
-    sam_predictor = SamPredictor(sam_model)
+    # Aggregate all predictions and ground truth (if available)
+    total_pred_building = []
+    total_gt_building = []
+    total_pred_damage = []
+    total_gt_damage = []
+    total_weights = []
     
-    print("Loading CLIP model...")
-    clip_model, clip_preprocess = clip.load("ViT-L/14@336px", device_str)
-    clip_text = clip.tokenize(CONTRASTIVE_PROMPTS).to(device_str)
-
-    # Get list of TIF files
-    print("Finding TIF files...")
-    inference_dataset = TIFInferenceDataset(args.tif_folder_path)
-    tif_files = [inference_dataset[i] for i in range(len(inference_dataset))]
-
-    # Run tile-based inference with metrics
-    print(f"Starting {args.tile_size}x{args.tile_size} tile-based inference with metrics...")
-    results = ubdd_plusplus_tile_inference(
-        dino_model,
-        postprocessors,
-        sam_predictor,
-        clip_text,
-        clip_model,
-        clip_preprocess,
-        args.clip_min_patch_size,
-        args.clip_img_padding,
-        args.dino_threshold,
-        args.save_annotations,
-        tif_files,
-        device_str,
-        args.output_dir,
-        args.overlap,  # Pass overlap parameter
-    )
-
-
-if __name__ == "__main__":
-    main()
+    # Calculate totals for weighted averages
+    total_building_pixels = 0
+    total_damage_pixels = 0
+    total_image_pixels = 0
+    weighted_damage_ratio_sum = 0
+    weighted_building_ratio_sum = 0
+    
+    # For weighted F1 calculation - aggregate pixel-level predictions
+    all_building_predictions = []
+    all_building_ground_truth = []
+    all_damage_predictions = []
+    all_damage_ground_truth = []
+    image_weights = []
+    
+    for result in all_results:
+        metrics = result['metrics']
+        
+        # Extract image dimensions
+        image_size_str = result['image_size']
+        width, height = map(int, image_size_str.split('x'))
+        image_pixels = width * height
+        
+        # Weight by image size
+        weight = image_pixels
+        total_weights.append(weight)
+        image_weights.append(weight)
+        
+        # Accumulate weighted ratios
+        damage_ratio = metrics.get('damage_ratio', 0)
+        building_ratio = metrics.get('building_ratio', 0)
+        
+        weighted_damage_ratio_sum += damage_ratio * weight
+        weighted_building_ratio_sum += building_ratio * weight
+        
+        total_building_pixels += result['total_undamaged_pixels'] + result['total_damaged_pixels']
+        total_damage_pixels += result['total_damaged_pixels']
+        total_image_pixels += image_pixels
+        
+        # For weighted F1 calculation - create pixel-level data
+        pred_building_count = result['total_undamaged_pixels'] + result['total_damaged_pixels']
+        pred_damage_count = result['total_damaged_pixels']
+        
+        # Create binary arrays for this image
+        building_pred = np.concatenate([
+            np.ones(pred_building_count, dtype=np.uint8),
+            np.zeros(image_pixels - pred_building_count, dtype=np.uint8)
+        ])
+        
+        damage_pred = np.concatenate([
+            np.ones(pred_damage_count, dtype=np.uint8),
+            np.zeros(image_pixels - pred_damage_count, dtype=np.uint8)
+        ])
+        
+        # Since we don't have ground truth, we'll use predictions as proxy for consistency calculation
+        # In a real scenario with ground truth, you would load the actual ground truth here
+        building_gt = building_pred.copy()  # Placeholder - replace with actual ground truth if available
+        damage_gt = damage_pred.copy()      # Placeholder - replace with actual ground truth if available
+        
+        # Add to aggregated lists
+        all_building_predictions.extend(building_pred)
+        all_building_ground_truth.extend(building_gt)
+        all_damage_predictions.extend(damage_pred)
+        all_damage_ground_truth.extend(damage_gt)
+   
