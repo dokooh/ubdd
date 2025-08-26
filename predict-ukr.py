@@ -1,5 +1,5 @@
 """
-U-BDD++ Evaluation with pre-trained CLIP - Modified for UKR TIF tile-based inference (256x256)
+U-BDD++ Evaluation with pre-trained CLIP - Modified for UKR TIF tile-based inference (512x512)
 """
 import argparse
 import torch
@@ -13,6 +13,8 @@ import os
 from PIL import Image
 import glob
 import math
+from sklearn.metrics import f1_score, roc_auc_score
+import json
 
 from segment_anything import SamPredictor, sam_model_registry
 import clip
@@ -25,19 +27,84 @@ from models.dino.util import box_ops
 from utils.filters import preliminary_filter
 from utils.utils import pixel_f1_iou
 
-# Constants - Updated for 256x256 tiles
-TILE_SIZE = 256
+# Constants - Updated for 512x512 tiles
+TILE_SIZE = 512
 DINO_TEXT_PROMPT = "building"
 DAMAGE_DICT_BGR = [[0, 0, 0], [70, 172, 0], [0, 140, 253]]
 
 
-class TIFTileDataset(Dataset):
-    """Dataset class for TIF image tile-based inference with 256x256 tiles"""
+def calculate_iou(pred_mask, gt_mask):
+    """Calculate Intersection over Union (IoU) for binary masks"""
+    intersection = np.logical_and(pred_mask, gt_mask).sum()
+    union = np.logical_or(pred_mask, gt_mask).sum()
+    if union == 0:
+        return 1.0 if intersection == 0 else 0.0
+    return intersection / union
+
+
+def calculate_metrics(pred_mask, gt_mask=None):
+    """Calculate IoU, F1, and AUROC metrics"""
+    metrics = {}
     
-    def __init__(self, tif_file_path, tile_size=TILE_SIZE, overlap=32):
+    # If no ground truth is provided, calculate basic statistics
+    if gt_mask is None:
+        metrics['damage_ratio'] = (pred_mask == 2).sum() / pred_mask.size
+        metrics['building_ratio'] = ((pred_mask == 1) | (pred_mask == 2)).sum() / pred_mask.size
+        return metrics
+    
+    # Convert to binary masks for different classes
+    pred_building = (pred_mask > 0).astype(np.uint8)  # Any building (damaged or undamaged)
+    pred_damage = (pred_mask == 2).astype(np.uint8)   # Only damaged buildings
+    
+    gt_building = (gt_mask > 0).astype(np.uint8)      # Any building (damaged or undamaged)
+    gt_damage = (gt_mask == 2).astype(np.uint8)       # Only damaged buildings
+    
+    # Calculate IoU for building detection
+    metrics['building_iou'] = calculate_iou(pred_building, gt_building)
+    
+    # Calculate IoU for damage detection
+    metrics['damage_iou'] = calculate_iou(pred_damage, gt_damage)
+    
+    # Calculate F1 scores
+    if gt_building.sum() > 0:
+        pred_flat = pred_building.flatten()
+        gt_flat = gt_building.flatten()
+        metrics['building_f1'] = f1_score(gt_flat, pred_flat, average='binary')
+    else:
+        metrics['building_f1'] = 0.0
+    
+    if gt_damage.sum() > 0:
+        pred_flat = pred_damage.flatten()
+        gt_flat = gt_damage.flatten()
+        metrics['damage_f1'] = f1_score(gt_flat, pred_flat, average='binary')
+    else:
+        metrics['damage_f1'] = 0.0
+    
+    # Calculate AUROC (only if we have both classes)
+    try:
+        if len(np.unique(gt_building)) > 1:
+            metrics['building_auroc'] = roc_auc_score(gt_building.flatten(), pred_building.flatten())
+        else:
+            metrics['building_auroc'] = 0.5
+            
+        if len(np.unique(gt_damage)) > 1:
+            metrics['damage_auroc'] = roc_auc_score(gt_damage.flatten(), pred_damage.flatten())
+        else:
+            metrics['damage_auroc'] = 0.5
+    except ValueError:
+        metrics['building_auroc'] = 0.5
+        metrics['damage_auroc'] = 0.5
+    
+    return metrics
+
+
+class TIFTileDataset(Dataset):
+    """Dataset class for TIF image tile-based inference with 512x512 tiles"""
+    
+    def __init__(self, tif_file_path, tile_size=TILE_SIZE, overlap=64):
         self.tif_file_path = tif_file_path
         self.tile_size = tile_size
-        self.overlap = overlap  # Increased overlap for better edge handling with smaller tiles
+        self.overlap = overlap  # Increased overlap for better edge handling
         
         # Load the full TIF image
         try:
@@ -47,7 +114,7 @@ class TIFTileDataset(Dataset):
         except Exception as e:
             raise ValueError(f"Error loading TIF file {tif_file_path}: {e}")
         
-        # Calculate tile grid for 256x256 tiles with overlap
+        # Calculate tile grid for 512x512 tiles with overlap
         step_size = tile_size - overlap
         self.tiles_x = max(1, math.ceil((self.original_width - overlap) / step_size))
         self.tiles_y = max(1, math.ceil((self.original_height - overlap) / step_size))
@@ -90,16 +157,16 @@ class TIFTileDataset(Dataset):
                     'height': end_y - start_y
                 })
         
-        # DINO transform - resize to 256x256 for consistent processing
+        # DINO transform - resize to 512x512 for consistent processing
         self.normalize = T.Compose([
-            T.Resize((256, 256), interpolation=T.InterpolationMode.BILINEAR),
+            T.Resize((512, 512), interpolation=T.InterpolationMode.BILINEAR),
             T.ToTensor(),
             T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
         
         # Transform for original image (without normalization but with resize)
         self.to_tensor = T.Compose([
-            T.Resize((256, 256), interpolation=T.InterpolationMode.BILINEAR),
+            T.Resize((512, 512), interpolation=T.InterpolationMode.BILINEAR),
             T.ToTensor()
         ])
     
@@ -120,7 +187,7 @@ class TIFTileDataset(Dataset):
         # Store original tile size before resizing
         original_tile_size = tile_image.size
         
-        # Resize tile to exactly 256x256 for processing
+        # Resize tile to exactly 512x512 for processing
         tile_image_resized = tile_image.resize((self.tile_size, self.tile_size), Image.Resampling.BILINEAR)
         
         # Apply transforms
@@ -192,7 +259,9 @@ def merge_tile_predictions_with_overlap(tile_results, image_info, output_path_ba
         # Convert to numpy array if it's a tensor and ensure float32 type
         if hasattr(pred_mask, 'cpu'):
             pred_mask = pred_mask.cpu().numpy()
-        pred_mask = pred_mask.astype(np.float32)
+        if hasattr(pred_mask, 'detach'):
+            pred_mask = pred_mask.detach().numpy()
+        pred_mask = np.asarray(pred_mask, dtype=np.float32)
         
         # Get original tile dimensions
         original_tile_width = tile_info['width']
@@ -212,18 +281,16 @@ def merge_tile_predictions_with_overlap(tile_results, image_info, output_path_ba
         tile_weight = np.ones((original_tile_height, original_tile_width), dtype=np.float32)
         
         if overlap > 0:
-            # Create distance-based weights (higher in center, lower at edges)
-            y_indices, x_indices = np.meshgrid(
-                np.arange(original_tile_height), 
-                np.arange(original_tile_width), 
-                indexing='ij'
-            )
+            # Create distance-based weights (higher in center, lower at edges) - ensure NumPy arrays
+            y_coords = np.arange(original_tile_height, dtype=np.float32)
+            x_coords = np.arange(original_tile_width, dtype=np.float32)
+            y_indices, x_indices = np.meshgrid(y_coords, x_coords, indexing='ij')
             
-            # Distance from edges
-            dist_from_left = x_indices.astype(np.float32)
-            dist_from_right = (original_tile_width - 1 - x_indices).astype(np.float32)
-            dist_from_top = y_indices.astype(np.float32)
-            dist_from_bottom = (original_tile_height - 1 - y_indices).astype(np.float32)
+            # Distance from edges (all NumPy operations)
+            dist_from_left = x_indices
+            dist_from_right = (original_tile_width - 1 - x_indices)
+            dist_from_top = y_indices
+            dist_from_bottom = (original_tile_height - 1 - y_indices)
             
             # Minimum distance from any edge
             edge_distance = np.minimum(
@@ -234,13 +301,14 @@ def merge_tile_predictions_with_overlap(tile_results, image_info, output_path_ba
             # Weight based on distance from edge (within overlap region)
             overlap_factor = min(overlap // 2, min(original_tile_height, original_tile_width) // 4)
             if overlap_factor > 0:
-                tile_weight = np.minimum(1.0, edge_distance / overlap_factor)
+                tile_weight = np.minimum(1.0, edge_distance / float(overlap_factor))
         
-        # Ensure tile_weight is numpy array with correct dtype
-        tile_weight = tile_weight.astype(np.float32)
+        # Ensure all arrays are NumPy float32
+        pred_mask_resized = np.asarray(pred_mask_resized, dtype=np.float32)
+        tile_weight = np.asarray(tile_weight, dtype=np.float32)
         
         # Place tile prediction in the full image with weighted averaging
-        start_y, start_x = tile_info['start_y'], tile_info['start_x']
+        start_y, start_x = int(tile_info['start_y']), int(tile_info['start_x'])
         end_y, end_x = start_y + original_tile_height, start_x + original_tile_width
         
         # Ensure indices are within bounds
@@ -337,7 +405,7 @@ def process_single_tile(
     dino_threshold,
     device
 ):
-    """Process a single 256x256 tile and return prediction results"""
+    """Process a single 512x512 tile and return prediction results"""
     
     # Get DINO predictions
     output = get_dino_output(
@@ -351,7 +419,7 @@ def process_single_tile(
     logits = output["scores"].detach().cpu()
     phrases = output["labels"]
     
-    # Convert boxes to xyxy format (scale by 256 for 256x256 tiles)
+    # Convert boxes to xyxy format (scale by 512 for 512x512 tiles)
     boxes = box_convert(boxes * TILE_SIZE, "cxcywh", "xyxy")
     
     # SAM prediction for all bounding boxes
@@ -382,7 +450,7 @@ def process_single_tile(
                 multimask_output=False,
             )
         
-        # CLIP Prediction for each bounding box (adjusted for 256x256 tiles)
+        # CLIP Prediction for each bounding box (adjusted for 512x512 tiles)
         predictions = []
         for bbox in boxes.tolist():
             # Crop out the image given bboxes
@@ -390,20 +458,16 @@ def process_single_tile(
             w = x2 - x1
             h = y2 - y1
             
-            # Apply the image buffer (adjusted for 256x256 tiles)
-            # Use smaller minimum patch size for smaller tiles
-            adjusted_min_patch_size = max(50, clip_min_patch_size // 2)
-            adjusted_padding = max(5, clip_img_padding // 2)
-            
+            # Apply the image buffer (restored to original values for 512x512 tiles)
             image_buffer_x = (
-                (adjusted_min_patch_size - w) / 2.0
-                if w < adjusted_min_patch_size
-                else adjusted_padding
+                (clip_min_patch_size - w) / 2.0
+                if w < clip_min_patch_size
+                else clip_img_padding
             )
             image_buffer_y = (
-                (adjusted_min_patch_size - h) / 2.0
-                if h < adjusted_min_patch_size
-                else adjusted_padding
+                (clip_min_patch_size - h) / 2.0
+                if h < clip_min_patch_size
+                else clip_img_padding
             )
             
             # Add padding for prediction
@@ -465,7 +529,7 @@ def process_single_tile(
     }
 
 
-# Updated inference function for 256x256 tile-based processing
+# Updated inference function for 512x512 tile-based processing with metrics
 def ubdd_plusplus_tile_inference(
     dino_model,
     dino_postprocessors,
@@ -479,27 +543,37 @@ def ubdd_plusplus_tile_inference(
     save_annotations,
     tif_files,
     device,
-    output_dir
+    output_dir,
+    overlap=64  # Increased overlap for 512x512 tiles
 ):
-    """Run 256x256 tile-based inference on TIF images and save results"""
+    """Run 512x512 tile-based inference on TIF images and save results with metrics"""
     
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
     
     all_results = []
+    overall_metrics = {
+        'total_files': 0,
+        'total_tiles': 0,
+        'total_detections': 0,
+        'total_damaged_pixels': 0,
+        'total_undamaged_pixels': 0,
+        'average_damage_ratio': 0.0,
+        'average_building_ratio': 0.0
+    }
     
     for tif_file in tqdm(tif_files, desc="Processing TIF files"):
         print(f"\nProcessing: {os.path.basename(tif_file)}")
         
-        # Create tile dataset for this TIF file (256x256 tiles)
-        tile_dataset = TIFTileDataset(tif_file, tile_size=TILE_SIZE)
+        # Create tile dataset for this TIF file (512x512 tiles)
+        tile_dataset = TIFTileDataset(tif_file, tile_size=TILE_SIZE, overlap=overlap)
         tile_dataloader = DataLoader(tile_dataset, batch_size=1, shuffle=False, num_workers=0)
         
         image_info = tile_dataset.get_image_info()
         tile_results = []
         
         # Process each tile
-        with tqdm(tile_dataloader, desc="Processing 256x256 tiles", leave=False) as tile_pbar:
+        with tqdm(tile_dataloader, desc="Processing 512x512 tiles", leave=False) as tile_pbar:
             for batch in tile_pbar:
                 # Extract single item from batch
                 single_batch = {}
@@ -543,10 +617,13 @@ def ubdd_plusplus_tile_inference(
         base_name = os.path.splitext(os.path.basename(tif_file))[0]
         output_path_base = os.path.join(output_dir, base_name)
         
-        print(f"Merging {len(tile_results)} 256x256 tiles with overlap handling...")
+        print(f"Merging {len(tile_results)} 512x512 tiles with overlap handling...")
         full_pred_mask, color_mask = merge_tile_predictions_with_overlap(
             tile_results, image_info, output_path_base
         )
+        
+        # Calculate metrics for this image
+        metrics = calculate_metrics(full_pred_mask)
         
         # Save original image for reference (downscaled if too large)
         original_image = Image.open(tif_file).convert('RGB')
@@ -561,7 +638,7 @@ def ubdd_plusplus_tile_inference(
         total_damaged = (full_pred_mask == 2).sum()
         total_undamaged = (full_pred_mask == 1).sum()
         
-        # Store results
+        # Store results with metrics
         result = {
             'file_name': os.path.basename(tif_file),
             'image_size': f"{image_info['width']}x{image_info['height']}",
@@ -572,20 +649,48 @@ def ubdd_plusplus_tile_inference(
             'total_damaged_pixels': int(total_damaged),
             'total_undamaged_pixels': int(total_undamaged),
             'damage_percentage': float(total_damaged) / (image_info['width'] * image_info['height']) * 100,
+            'metrics': metrics,
             'tile_results': tile_results
         }
         all_results.append(result)
         
+        # Update overall metrics
+        overall_metrics['total_files'] += 1
+        overall_metrics['total_tiles'] += len(tile_results)
+        overall_metrics['total_detections'] += total_detections
+        overall_metrics['total_damaged_pixels'] += int(total_damaged)
+        overall_metrics['total_undamaged_pixels'] += int(total_undamaged)
+        overall_metrics['average_damage_ratio'] += metrics.get('damage_ratio', 0)
+        overall_metrics['average_building_ratio'] += metrics.get('building_ratio', 0)
+        
         print(f"Completed {os.path.basename(tif_file)}: "
               f"{total_detections} detections, "
               f"{total_damaged} damaged pixels, "
-              f"{total_undamaged} undamaged pixels")
+              f"{total_undamaged} undamaged pixels, "
+              f"Damage ratio: {metrics.get('damage_ratio', 0):.4f}")
     
-    # Save summary results
-    summary_path = os.path.join(output_dir, "tile_inference_summary_256.txt")
+    # Calculate average metrics
+    if overall_metrics['total_files'] > 0:
+        overall_metrics['average_damage_ratio'] /= overall_metrics['total_files']
+        overall_metrics['average_building_ratio'] /= overall_metrics['total_files']
+    
+    # Save summary results with metrics
+    summary_path = os.path.join(output_dir, "tile_inference_summary_512.txt")
     with open(summary_path, 'w') as f:
-        f.write("TIF 256x256 Tile-based Inference Summary\n")
-        f.write("========================================\n\n")
+        f.write("TIF 512x512 Tile-based Inference Summary with Metrics\n")
+        f.write("====================================================\n\n")
+        
+        # Overall metrics
+        f.write("OVERALL METRICS:\n")
+        f.write(f"  Total files processed: {overall_metrics['total_files']}\n")
+        f.write(f"  Total tiles processed: {overall_metrics['total_tiles']}\n")
+        f.write(f"  Total detections: {overall_metrics['total_detections']}\n")
+        f.write(f"  Average damage ratio: {overall_metrics['average_damage_ratio']:.4f}\n")
+        f.write(f"  Average building ratio: {overall_metrics['average_building_ratio']:.4f}\n\n")
+        
+        # Per-file results
+        f.write("PER-FILE RESULTS:\n")
+        f.write("-" * 50 + "\n")
         for result in all_results:
             f.write(f"File: {result['file_name']}\n")
             f.write(f"  Image size: {result['image_size']}\n")
@@ -595,15 +700,42 @@ def ubdd_plusplus_tile_inference(
             f.write(f"  Total detections: {result['total_detections']}\n")
             f.write(f"  Damaged pixels: {result['total_damaged_pixels']}\n")
             f.write(f"  Undamaged pixels: {result['total_undamaged_pixels']}\n")
-            f.write(f"  Damage percentage: {result['damage_percentage']:.2f}%\n\n")
+            f.write(f"  Damage percentage: {result['damage_percentage']:.2f}%\n")
+            
+            metrics = result['metrics']
+            f.write(f"  Metrics:\n")
+            f.write(f"    Damage ratio: {metrics.get('damage_ratio', 0):.4f}\n")
+            f.write(f"    Building ratio: {metrics.get('building_ratio', 0):.4f}\n")
+            f.write("\n")
     
-    print(f"\n256x256 tile-based inference completed! Results saved to: {output_dir}")
+    # Save detailed metrics as JSON
+    metrics_path = os.path.join(output_dir, "metrics_512.json")
+    with open(metrics_path, 'w') as f:
+        json.dump({
+            'overall_metrics': overall_metrics,
+            'per_file_metrics': [
+                {
+                    'file_name': result['file_name'],
+                    'metrics': result['metrics'],
+                    'summary': {
+                        'total_detections': result['total_detections'],
+                        'damage_percentage': result['damage_percentage'],
+                        'num_tiles': result['num_tiles']
+                    }
+                }
+                for result in all_results
+            ]
+        }, f, indent=2)
+    
+    print(f"\n512x512 tile-based inference completed! Results saved to: {output_dir}")
     print(f"Processed {len(all_results)} TIF images")
+    print(f"Average damage ratio: {overall_metrics['average_damage_ratio']:.4f}")
+    print(f"Average building ratio: {overall_metrics['average_building_ratio']:.4f}")
     return all_results
 
 
 def get_args():
-    parser = argparse.ArgumentParser(description="TIF Image 256x256 Tile-based Inference with U-BDD++")
+    parser = argparse.ArgumentParser(description="TIF Image 512x512 Tile-based Inference with U-BDD++ and Metrics")
     parser.add_argument(
         "--tif-folder-path",
         "-tfp",
@@ -616,7 +748,7 @@ def get_args():
         "--output-dir",
         "-od",
         type=str,
-        default="outputs/tif_tile_inference_256",
+        default="outputs/tif_tile_inference_512",
         help="Output directory for results",
         dest="output_dir",
     )
@@ -624,7 +756,7 @@ def get_args():
         "--clip-min-patch-size",
         "-cmps",
         type=int,
-        default=50,  # Reduced for smaller tiles
+        default=100,  # Restored to original value for 512x512 tiles
         help="Minimum patch size for CLIP",
         dest="clip_min_patch_size",
     )
@@ -632,7 +764,7 @@ def get_args():
         "--clip-img-padding",
         "-cip",
         type=int,
-        default=5,  # Reduced for smaller tiles
+        default=10,  # Restored to original value for 512x512 tiles
         help="Padding of patch for CLIP",
         dest="clip_img_padding",
     )
@@ -679,16 +811,16 @@ def get_args():
         "--tile-size",
         "-ts",
         type=int,
-        default=256,
-        help="Size of tiles for processing (default: 256)",
+        default=512,
+        help="Size of tiles for processing (default: 512)",
         dest="tile_size",
     )
     parser.add_argument(
         "--overlap",
         "-ov",
         type=int,
-        default=32,
-        help="Overlap between tiles in pixels (default: 32)",
+        default=64,
+        help="Overlap between tiles in pixels (default: 64)",
         dest="overlap",
     )
     return parser.parse_args()
@@ -729,8 +861,8 @@ def main():
     inference_dataset = TIFInferenceDataset(args.tif_folder_path)
     tif_files = [inference_dataset[i] for i in range(len(inference_dataset))]
 
-    # Run tile-based inference
-    print(f"Starting {args.tile_size}x{args.tile_size} tile-based inference...")
+    # Run tile-based inference with metrics
+    print(f"Starting {args.tile_size}x{args.tile_size} tile-based inference with metrics...")
     results = ubdd_plusplus_tile_inference(
         dino_model,
         postprocessors,
@@ -745,6 +877,7 @@ def main():
         tif_files,
         device_str,
         args.output_dir,
+        args.overlap,  # Pass overlap parameter
     )
 
 
