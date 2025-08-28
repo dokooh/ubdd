@@ -1003,7 +1003,8 @@ def ubdd_plusplus_tile_inference(
     tif_files,
     device,
     output_dir,
-    overlap=128  # Increased overlap for 1024x1024 tiles
+    overlap=128,  # Increased overlap for 1024x1024 tiles
+    gt_dir=None  # Add ground truth directory parameter
 ):
     """Run 1024x1024 tile-based inference on TIF images and save results with detailed metrics"""
     
@@ -1018,11 +1019,24 @@ def ubdd_plusplus_tile_inference(
         'total_damaged_pixels': 0,
         'total_undamaged_pixels': 0,
         'average_damage_ratio': 0.0,
-        'average_building_ratio': 0.0
+        'average_building_ratio': 0.0,
+        'files_with_gt': 0,
+        'average_building_iou': 0.0,
+        'average_damage_iou': 0.0,
+        'average_building_f1': 0.0,
+        'average_damage_f1': 0.0
     }
     
     for tif_file in tqdm(tif_files, desc="Processing TIF files"):
         print(f"\nProcessing: {os.path.basename(tif_file)}")
+        
+        # Load ground truth if available
+        gt_mask = None
+        if gt_dir:
+            gt_mask = load_ground_truth_mask(tif_file, gt_dir)
+            if gt_mask is not None:
+                print(f"  Ground truth loaded: {gt_mask.shape}")
+                overall_metrics['files_with_gt'] += 1
         
         # Create tile dataset for this TIF file (1024x1024 tiles)
         tile_dataset = TIFTileDataset(tif_file, tile_size=TILE_SIZE, overlap=overlap)
@@ -1038,13 +1052,10 @@ def ubdd_plusplus_tile_inference(
                 single_batch = {}
                 for k, v in batch.items():
                     if k == 'tile_info':
-                        # tile_info is a list of dicts, extract the first dict
                         single_batch[k] = v[0] if isinstance(v, list) and len(v) > 0 else v
                     elif isinstance(v, (list, tuple)) and len(v) > 0:
-                        # For tensors and other data, get the first item
                         single_batch[k] = v[0]
                     elif hasattr(v, 'squeeze'):
-                        # For tensors, remove batch dimension
                         single_batch[k] = v.squeeze(0)
                     else:
                         single_batch[k] = v
@@ -1081,12 +1092,37 @@ def ubdd_plusplus_tile_inference(
             tile_results, image_info, output_path_base
         )
         
-        # Calculate detailed metrics for this image
-        metrics = calculate_detailed_metrics(full_pred_mask)
+        # Calculate metrics (with or without ground truth)
+        if gt_mask is not None:
+            metrics = calculate_metrics_with_ground_truth(full_pred_mask, gt_mask)
+            print(f"\nMETRICS WITH GROUND TRUTH FOR {os.path.basename(tif_file)}:")
+            print(f"  Building IoU:      {metrics['building_iou']:.4f}")
+            print(f"  Damage IoU:        {metrics['damage_iou']:.4f}")
+            print(f"  Building F1:       {metrics['building_f1']:.4f}")
+            print(f"  Damage F1:         {metrics['damage_f1']:.4f}")
+            print(f"  Building AUROC:    {metrics['building_auroc']:.4f}")
+            print(f"  Damage AUROC:      {metrics['damage_auroc']:.4f}")
+            print(f"  Building Precision: {metrics['building_precision']:.4f}")
+            print(f"  Building Recall:   {metrics['building_recall']:.4f}")
+            print(f"  Damage Precision:  {metrics['damage_precision']:.4f}")
+            print(f"  Damage Recall:     {metrics['damage_recall']:.4f}")
+            
+            # Update overall metrics with ground truth results
+            overall_metrics['average_building_iou'] += metrics['building_iou']
+            overall_metrics['average_damage_iou'] += metrics['damage_iou']
+            overall_metrics['average_building_f1'] += metrics['building_f1']
+            overall_metrics['average_damage_f1'] += metrics['damage_f1']
+        else:
+            # Use pixel-based metrics when no ground truth
+            metrics = calculate_detailed_metrics(full_pred_mask)
+            print(f"\nPIXEL-BASED METRICS FOR {os.path.basename(tif_file)}:")
+            print(f"  Building Coverage: {metrics.get('building_coverage', 0):.4f}")
+            print(f"  Damage Ratio:      {metrics.get('damage_ratio', 0):.4f}")
+            print(f"  Damage Precision:  {metrics.get('damage_precision', 0):.4f}")
         
         # Save original image for reference (downscaled if too large)
         original_image = Image.open(tif_file).convert('RGB')
-        if max(original_image.size) > 4096:  # Downscale very large images for reference
+        if max(original_image.size) > 4096:
             original_image.thumbnail((4096, 4096), Image.Resampling.LANCZOS)
         
         original_output_path = f"{output_path_base}_original.png"
@@ -1096,22 +1132,6 @@ def ubdd_plusplus_tile_inference(
         total_detections = sum(tile['num_detections'] for tile in tile_results)
         total_damaged = (full_pred_mask == 2).sum()
         total_undamaged = (full_pred_mask == 1).sum()
-        
-        # Print metrics for this file
-        print(f"\nMETRICS FOR {os.path.basename(tif_file)}:")
-        print(f"  Building IoU:               {metrics.get('building_iou', 'N/A'):.6f}")
-        print(f"  Damage IoU:                 {metrics.get('damage_iou', 'N/A'):.6f}")
-        print(f"  Building F1:                {metrics.get('building_f1', 'N/A'):.6f}")
-        print(f"  Damage F1:                  {metrics.get('damage_f1', 'N/A'):.6f}")
-        print(f"  Damage-to-Building IoU:     {metrics.get('damage_building_iou', 'N/A'):.6f}")
-        print(f"  Undamaged-to-Building IoU:  {metrics.get('undamaged_building_iou', 'N/A'):.6f}")
-        print(f"  Damage-to-Undamaged Ratio:  {metrics.get('damage_undamaged_ratio', 'N/A'):.6f}")
-        print(f"  Building Coverage:          {metrics.get('building_coverage', 'N/A'):.6f}")
-        print(f"  Damage Precision:           {metrics.get('damage_precision', 'N/A'):.6f}")
-        print(f"  Total Detections:           {total_detections}")
-        print(f"  Damaged Pixels:             {total_damaged}")
-        print(f"  Undamaged Pixels:           {total_undamaged}")
-        print(f"  Damage Percentage:          {float(total_damaged) / (image_info['width'] * image_info['height']) * 100:.4f}%")
         
         # Store results with detailed metrics
         result = {
@@ -1125,6 +1145,7 @@ def ubdd_plusplus_tile_inference(
             'total_undamaged_pixels': int(total_undamaged),
             'damage_percentage': float(total_damaged) / (image_info['width'] * image_info['height']) * 100,
             'metrics': metrics,
+            'has_ground_truth': gt_mask is not None,
             'tile_results': tile_results
         }
         all_results.append(result)
@@ -1143,7 +1164,13 @@ def ubdd_plusplus_tile_inference(
         overall_metrics['average_damage_ratio'] /= overall_metrics['total_files']
         overall_metrics['average_building_ratio'] /= overall_metrics['total_files']
     
-    # Save detailed metrics per file and get weighted metrics (including weighted F1)
+    if overall_metrics['files_with_gt'] > 0:
+        overall_metrics['average_building_iou'] /= overall_metrics['files_with_gt']
+        overall_metrics['average_damage_iou'] /= overall_metrics['files_with_gt']
+        overall_metrics['average_building_f1'] /= overall_metrics['files_with_gt']
+        overall_metrics['average_damage_f1'] /= overall_metrics['files_with_gt']
+    
+    # Save detailed metrics per file and get weighted metrics
     weighted_metrics = save_detailed_metrics(all_results, output_dir)
     
     # Save summary results with metrics
@@ -1262,7 +1289,7 @@ def get_args():
     parser.add_argument(
         "--dino-threshold",
         "-dt",
-        type=float,
+               type=float,
         default=0.15,
         help="Threshold for DINO bounding box prediction",
         dest="dino_threshold",
@@ -1298,6 +1325,14 @@ def get_args():
         help="Overlap between tiles in pixels (default: 128)",
         dest="overlap",
     )
+    parser.add_argument(
+        "--ground-truth-dir",
+        "-gtd",
+        type=str,
+        default=None,
+        help="Directory containing ground truth masks (optional)",
+        dest="ground_truth_dir",
+    )
     return parser.parse_args()
 
 
@@ -1312,6 +1347,9 @@ def main():
     print(f"Output directory: {args.output_dir}")
     print(f"Tile size: {args.tile_size}x{args.tile_size}")
     print(f"Tile overlap: {args.overlap}px")
+    
+    if args.ground_truth_dir:
+        print(f"Ground truth directory: {args.ground_truth_dir}")
 
     # Update global tile size if provided
     global TILE_SIZE
@@ -1352,7 +1390,8 @@ def main():
         tif_files,
         device_str,
         args.output_dir,
-        args.overlap,  # Pass overlap parameter
+        args.overlap,
+        args.ground_truth_dir,  # Pass ground truth directory
     )
 
 
