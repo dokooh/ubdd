@@ -228,6 +228,97 @@ def calculate_pixel_based_iou(pred_mask):
 
 # Add these functions after the save_detailed_metrics function (around line 540)
 
+# Add this function after the calculate_pixel_based_iou function (around line 200)
+
+def calculate_weighted_metrics(all_results):
+    """Calculate weighted metrics across all images without ground truth"""
+    
+    weighted_metrics = {
+        'total_files': len(all_results),
+        'files_with_gt': 0,
+        'files_without_gt': len(all_results)
+    }
+    
+    # Totals for weighted averages
+    total_building_pixels = 0
+    total_damage_pixels = 0
+    total_image_pixels = 0
+    weighted_damage_ratio_sum = 0
+    weighted_building_ratio_sum = 0
+    all_weights = []
+    
+    # Accumulate metrics from all results
+    for result in all_results:
+        metrics = result['metrics']
+        
+        # Extract image dimensions and calculate weight
+        image_size_str = result['image_size']
+        width, height = map(int, image_size_str.split('x'))
+        image_pixels = width * height
+        weight = image_pixels
+        all_weights.append(weight)
+        
+        # Accumulate weighted metrics
+        damage_ratio = metrics.get('damage_ratio', 0)
+        building_ratio = metrics.get('building_ratio', 0)
+        
+        weighted_damage_ratio_sum += damage_ratio * weight
+        weighted_building_ratio_sum += building_ratio * weight
+        
+        # Accumulate pixel counts
+        total_building_pixels += result['total_undamaged_pixels'] + result['total_damaged_pixels']
+        total_damage_pixels += result['total_damaged_pixels']
+        total_image_pixels += image_pixels
+    
+    # Calculate weighted averages
+    total_weight = sum(all_weights) if all_weights else 1
+    
+    # Basic weighted metrics (no ground truth available)
+    weighted_metrics.update({
+        'weighted_damage_ratio': weighted_damage_ratio_sum / total_weight,
+        'weighted_building_ratio': weighted_building_ratio_sum / total_weight,
+        'weighted_building_iou': 'N/A (No ground truth)',
+        'weighted_damage_iou': 'N/A (No ground truth)',
+        'weighted_building_f1': 'N/A (No ground truth)',
+        'weighted_damage_f1': 'N/A (No ground truth)',
+        'weighted_building_auroc': 'N/A (No ground truth)',
+        'weighted_damage_auroc': 'N/A (No ground truth)',
+    })
+    
+    # Overall pixel-level metrics
+    weighted_metrics.update({
+        'overall_damage_ratio': total_damage_pixels / total_image_pixels if total_image_pixels > 0 else 0,
+        'overall_building_ratio': total_building_pixels / total_image_pixels if total_image_pixels > 0 else 0,
+        'total_building_pixels': total_building_pixels,
+        'total_damage_pixels': total_damage_pixels,
+        'total_image_pixels': total_image_pixels
+    })
+    
+    # Calculate prediction consistency metrics (building-level analysis)
+    building_ratios = [result['metrics'].get('building_ratio', 0) for result in all_results]
+    damage_ratios = [result['metrics'].get('damage_ratio', 0) for result in all_results]
+    
+    # Standard deviation as consistency measure (lower = more consistent)
+    if len(building_ratios) > 1:
+        building_std = np.std(building_ratios)
+        damage_std = np.std(damage_ratios)
+        
+        # Convert to consistency score (1 - normalized std)
+        building_consistency = max(0, 1 - (building_std / (np.mean(building_ratios) + 1e-8)))
+        damage_consistency = max(0, 1 - (damage_std / (np.mean(damage_ratios) + 1e-8)))
+        
+        weighted_metrics.update({
+            'building_prediction_consistency': building_consistency,
+            'damage_prediction_consistency': damage_consistency,
+        })
+    else:
+        weighted_metrics.update({
+            'building_prediction_consistency': 1.0,
+            'damage_prediction_consistency': 1.0,
+        })
+    
+    return weighted_metrics
+
 def load_ground_truth_mask(tif_path, gt_dir):
     """Load ground truth mask for a given TIF file"""
     # Extract city name from TIF filename
