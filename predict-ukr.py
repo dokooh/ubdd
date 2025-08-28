@@ -1640,8 +1640,8 @@ def ubdd_plusplus_tile_inference(
         f.write("WEIGHTED METRICS (by image size):\n")
         f.write(f"  Weighted damage ratio: {weighted_metrics['weighted_damage_ratio']:.6f}\n")
         f.write(f"  Weighted building ratio: {weighted_metrics['weighted_building_ratio']:.6f}\n")
-        f.write(f"  Weighted building F1: {weighted_metrics['weighted_building_f1']}\n")
-        f.write(f"  Weighted damage F1: {weighted_metrics['weighted_damage_f1']}\n")
+        f.write(f"  Weighted Building F1: {weighted_metrics['weighted_building_f1']}\n")
+        f.write(f"  Weighted Damage F1: {weighted_metrics['weighted_damage_f1']}\n")
         f.write(f"  Overall damage ratio: {weighted_metrics['overall_damage_ratio']:.6f}\n")
         f.write(f"  Overall building ratio: {weighted_metrics['overall_building_ratio']:.6f}\n\n")
         
@@ -1838,7 +1838,7 @@ def main():
         args.save_annotations,
         tif_files,
         device_str,
-        args.output_dir,
+        args.output_dir,    
         args.overlap,
         args.ground_truth_dir,  # Pass ground truth directory
     )
