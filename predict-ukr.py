@@ -27,8 +27,8 @@ from models.dino.util import box_ops
 from utils.filters import preliminary_filter
 from utils.utils import pixel_f1_iou
 
-# Constants - Updated for 2048x2048 tiles
-TILE_SIZE = 2048
+# Constants - Updated for 1024x1024 tiles
+TILE_SIZE = 1024
 DINO_TEXT_PROMPT = "building"
 DAMAGE_DICT_BGR = [[0, 0, 0], [70, 172, 0], [0, 140, 253]]
 
@@ -1098,12 +1098,12 @@ def save_detailed_metrics(all_results, output_dir):
     return weighted_metrics
 
 class TIFTileDataset(Dataset):
-    """Dataset class for TIF image tile-based inference with 2048x2048 tiles"""
+    """Dataset class for TIF image tile-based inference with 1024x1024 tiles"""
     
-    def __init__(self, tif_file_path, tile_size=TILE_SIZE, overlap=256):  # Increased overlap for larger tiles
+    def __init__(self, tif_file_path, tile_size=TILE_SIZE, overlap=128):  # Reduced overlap for smaller tiles
         self.tif_file_path = tif_file_path
         self.tile_size = tile_size
-        self.overlap = overlap  # Increased overlap for larger tiles
+        self.overlap = overlap  # Reduced overlap for smaller tiles
         
         # Load the full TIF image
         try:
@@ -1113,7 +1113,7 @@ class TIFTileDataset(Dataset):
         except Exception as e:
             raise ValueError(f"Error loading TIF file {tif_file_path}: {e}")
         
-        # Calculate tile grid for 2048x2048 tiles with overlap
+        # Calculate tile grid for 1024x1024 tiles with overlap
         step_size = tile_size - overlap
         self.tiles_x = max(1, math.ceil((self.original_width - overlap) / step_size))
         self.tiles_y = max(1, math.ceil((self.original_height - overlap) / step_size))
@@ -1156,16 +1156,16 @@ class TIFTileDataset(Dataset):
                     'height': end_y - start_y
                 })
         
-        # DINO transform - resize to 2048x2048 for consistent processing
+        # DINO transform - resize to 1024x1024 for consistent processing
         self.normalize = T.Compose([
-            T.Resize((2048, 2048), interpolation=T.InterpolationMode.BILINEAR),
+            T.Resize((1024, 1024), interpolation=T.InterpolationMode.BILINEAR),
             T.ToTensor(),
             T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
         
         # Transform for original image (without normalization but with resize)
         self.to_tensor = T.Compose([
-            T.Resize((2048, 2048), interpolation=T.InterpolationMode.BILINEAR),
+            T.Resize((1024, 1024), interpolation=T.InterpolationMode.BILINEAR),
             T.ToTensor()
         ])
     
@@ -1186,7 +1186,7 @@ class TIFTileDataset(Dataset):
         # Store original tile size before resizing
         original_tile_size = tile_image.size
         
-        # Resize tile to exactly 2048x2048 for processing
+        # Resize tile to exactly 1024x1024 for processing
         tile_image_resized = tile_image.resize((self.tile_size, self.tile_size), Image.Resampling.BILINEAR)
         
         # Apply transforms
@@ -1239,7 +1239,7 @@ class TIFInferenceDataset(Dataset):
 
 
 def merge_tile_predictions_with_overlap(tile_results, image_info, output_path_base):
-    """Merge individual tile predictions with overlap handling - optimized for 2048x2048 tiles"""
+    """Merge individual tile predictions with overlap handling - optimized for 1024x1024 tiles"""
     
     # Initialize full-size prediction arrays
     full_width = image_info['width']
@@ -1298,8 +1298,8 @@ def merge_tile_predictions_with_overlap(tile_results, image_info, output_path_ba
             )
             
             # Weight based on distance from edge (within overlap region)
-            # Adjusted for larger 2048x2048 tiles
-            overlap_factor = min(overlap // 2, min(original_tile_height, original_tile_width) // 8)
+            # Adjusted for 1024x1024 tiles
+            overlap_factor = min(overlap // 2, min(original_tile_height, original_tile_width) // 4)
             if overlap_factor > 0:
                 tile_weight = np.minimum(1.0, edge_distance / float(overlap_factor))
         
@@ -1405,7 +1405,7 @@ def process_single_tile(
     dino_threshold,
     device
 ):
-    """Process a single 2048x2048 tile and return prediction results"""
+    """Process a single 1024x1024 tile and return prediction results"""
     
     # Get DINO predictions
     output = get_dino_output(
@@ -1419,7 +1419,7 @@ def process_single_tile(
     logits = output["scores"].detach().cpu()
     phrases = output["labels"]
     
-    # Convert boxes to xyxy format (scale by 2048 for 2048x2048 tiles)
+    # Convert boxes to xyxy format (scale by 1024 for 1024x1024 tiles)
     boxes = box_convert(boxes * TILE_SIZE, "cxcywh", "xyxy")
     
     # SAM prediction for all bounding boxes
@@ -1450,7 +1450,7 @@ def process_single_tile(
                 multimask_output=False,
             )
         
-        # CLIP Prediction for each bounding box (adjusted for 2048x2048 tiles)
+        # CLIP Prediction for each bounding box (adjusted for 1024x1024 tiles)
         predictions = []
         for bbox in boxes.tolist():
             # Crop out the image given bboxes
@@ -1458,7 +1458,7 @@ def process_single_tile(
             w = x2 - x1
             h = y2 - y1
             
-            # Apply the image buffer (adjusted values for 2048x2048 tiles)
+            # Apply the image buffer (adjusted values for 1024x1024 tiles)
             image_buffer_x = (
                 (clip_min_patch_size - w) / 2.0
                 if w < clip_min_patch_size
@@ -1529,7 +1529,7 @@ def process_single_tile(
     }
 
 
-# Updated inference function for 2048x2048 tile-based processing with metrics
+# Updated inference function for 1024x1024 tile-based processing with metrics
 def ubdd_plusplus_tile_inference(
     dino_model,
     dino_postprocessors,
@@ -1544,10 +1544,10 @@ def ubdd_plusplus_tile_inference(
     tif_files,
     device,
     output_dir,
-    overlap=256,  # Increased overlap for 2048x2048 tiles
+    overlap=128,  # Reduced overlap for 1024x1024 tiles
     gt_dir=None  # Add ground truth directory parameter
 ):
-    """Run 2048x2048 tile-based inference on TIF images and save results with detailed metrics"""
+    """Run 1024x1024 tile-based inference on TIF images and save results with detailed metrics"""
     
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
@@ -1579,7 +1579,7 @@ def ubdd_plusplus_tile_inference(
                 print(f"  Ground truth loaded: {gt_mask.shape}")
                 overall_metrics['files_with_gt'] += 1
         
-        # Create tile dataset for this TIF file (2048x2048 tiles)
+        # Create tile dataset for this TIF file (1024x1024 tiles)
         tile_dataset = TIFTileDataset(tif_file, tile_size=TILE_SIZE, overlap=overlap)
         tile_dataloader = DataLoader(tile_dataset, batch_size=1, shuffle=False, num_workers=0)
         
@@ -1587,7 +1587,7 @@ def ubdd_plusplus_tile_inference(
         tile_results = []
         
         # Process each tile
-        with tqdm(tile_dataloader, desc="Processing 2048x2048 tiles", leave=False) as tile_pbar:
+        with tqdm(tile_dataloader, desc="Processing 1024x1024 tiles", leave=False) as tile_pbar:
             for batch in tile_pbar:
                 # Extract single item from batch
                 single_batch = {}
@@ -1628,7 +1628,7 @@ def ubdd_plusplus_tile_inference(
         base_name = os.path.splitext(os.path.basename(tif_file))[0]
         output_path_base = os.path.join(output_dir, base_name)
         
-        print(f"Merging {len(tile_results)} 2048x2048 tiles with overlap handling...")
+        print(f"Merging {len(tile_results)} 1024x1024 tiles with overlap handling...")
         full_pred_mask, color_mask = merge_tile_predictions_with_overlap(
             tile_results, image_info, output_path_base
         )
@@ -1715,9 +1715,9 @@ def ubdd_plusplus_tile_inference(
     weighted_metrics = save_detailed_metrics(all_results, output_dir)
     
     # Save summary results with metrics
-    summary_path = os.path.join(output_dir, "tile_inference_summary_2048.txt")
+    summary_path = os.path.join(output_dir, "tile_inference_summary_1024.txt")
     with open(summary_path, 'w') as f:
-        f.write("TIF 2048x2048 Tile-based Inference Summary with Metrics\n")
+        f.write("TIF 1024x1024 Tile-based Inference Summary with Metrics\n")
         f.write("======================================================\n\n")
         
         # Overall metrics
@@ -1750,7 +1750,7 @@ def ubdd_plusplus_tile_inference(
             f.write("\n")
     
     # Save detailed metrics as JSON with weighted metrics including F1
-    metrics_path = os.path.join(output_dir, "metrics_2048.json")
+    metrics_path = os.path.join(output_dir, "metrics_1024.json")
     with open(metrics_path, 'w') as f:
         json.dump({
             'overall_metrics': overall_metrics,
@@ -1769,7 +1769,7 @@ def ubdd_plusplus_tile_inference(
             ]
         }, f, indent=2)
     
-    print(f"\n2048x2048 tile-based inference completed! Results saved to: {output_dir}")
+    print(f"\n1024x1024 tile-based inference completed! Results saved to: {output_dir}")
     print(f"Processed {len(all_results)} TIF images")
     print(f"Average damage ratio: {overall_metrics['average_damage_ratio']:.4f}")
     print(f"Average building ratio: {overall_metrics['average_building_ratio']:.4f}")
@@ -1778,7 +1778,7 @@ def ubdd_plusplus_tile_inference(
 
 
 def get_args():
-    parser = argparse.ArgumentParser(description="TIF Image 2048x2048 Tile-based Inference with U-BDD++ and Metrics")
+    parser = argparse.ArgumentParser(description="TIF Image 1024x1024 Tile-based Inference with U-BDD++ and Metrics")
     parser.add_argument(
         "--tif-folder-path",
         "-tfp",
@@ -1791,7 +1791,7 @@ def get_args():
         "--output-dir",
         "-od",
         type=str,
-        default="outputs/tif_tile_inference_2048",
+        default="outputs/tif_tile_inference_1024",
         help="Output directory for results",
         dest="output_dir",
     )
@@ -1799,7 +1799,7 @@ def get_args():
         "--clip-min-patch-size",
         "-cmps",
         type=int,
-        default=300,  # Increased for 2048x2048 tiles
+        default=200,  # Reduced for 1024x1024 tiles
         help="Minimum patch size for CLIP",
         dest="clip_min_patch_size",
     )
@@ -1807,7 +1807,7 @@ def get_args():
         "--clip-img-padding",
         "-cip",
         type=int,
-        default=30,  # Increased for 2048x2048 tiles
+        default=20,  # Reduced for 1024x1024 tiles
         help="Padding of patch for CLIP",
         dest="clip_img_padding",
     )
@@ -1854,16 +1854,16 @@ def get_args():
         "--tile-size",
         "-ts",
         type=int,
-        default=2048,  # Updated default to 2048
-        help="Size of tiles for processing (default: 2048)",
+        default=1024,  # Updated default to 1024
+        help="Size of tiles for processing (default: 1024)",
         dest="tile_size",
     )
     parser.add_argument(
         "--overlap",
         "-ov",
         type=int,
-        default=256,  # Increased default overlap for 2048x2048 tiles
-        help="Overlap between tiles in pixels (default: 256)",
+        default=128,  # Reduced default overlap for 1024x1024 tiles
+        help="Overlap between tiles in pixels (default: 128)",
         dest="overlap",
     )
     parser.add_argument(
