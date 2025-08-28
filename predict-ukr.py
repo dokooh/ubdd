@@ -226,8 +226,125 @@ def calculate_pixel_based_iou(pred_mask):
         'total_background_pixels': int(total_background)
     }
 
-# Add these functions after the calculate_pixel_based_iou function (around line 245)
+# Add these functions after the save_detailed_metrics function (around line 540)
 
+def load_ground_truth_mask(tif_path, gt_dir):
+    """Load ground truth mask for a given TIF file"""
+    # Extract city name from TIF filename
+    base_name = os.path.basename(tif_path)
+    
+    # Try to extract city name (assuming format: CityName_pre/post_disaster_ortho.tif)
+    city_name = None
+    for city in ['Bucha', 'Chernihiv', 'Kerson', 'Mykolaiv']:
+        if base_name.lower().startswith(city.lower()):
+            city_name = city
+            break
+    
+    if city_name is None:
+        return None
+    
+    # Load ground truth mask
+    gt_mask_path = os.path.join(gt_dir, f"{city_name}_ground_truth.npy")
+    if os.path.exists(gt_mask_path):
+        return np.load(gt_mask_path)
+    
+    # Try alternative naming conventions
+    gt_mask_path = os.path.join(gt_dir, f"{city_name.lower()}_ground_truth.npy")
+    if os.path.exists(gt_mask_path):
+        return np.load(gt_mask_path)
+        
+    # Try loading PNG format
+    gt_mask_path = os.path.join(gt_dir, f"{city_name}_ground_truth.png")
+    if os.path.exists(gt_mask_path):
+        gt_mask = cv2.imread(gt_mask_path, cv2.IMREAD_GRAYSCALE)
+        return gt_mask
+    
+    return None
+
+
+def calculate_metrics_with_ground_truth(pred_mask, gt_mask):
+    """Calculate comprehensive metrics using ground truth"""
+    metrics = {}
+    
+    # Ensure masks have the same shape
+    if pred_mask.shape != gt_mask.shape:
+        # Resize prediction to match ground truth
+        pred_mask_resized = cv2.resize(pred_mask, (gt_mask.shape[1], gt_mask.shape[0]), 
+                                       interpolation=cv2.INTER_NEAREST)
+    else:
+        pred_mask_resized = pred_mask
+    
+    # Convert to binary masks for different classes
+    pred_building = (pred_mask_resized > 0).astype(np.uint8)
+    pred_damage = (pred_mask_resized == 2).astype(np.uint8)
+    
+    gt_building = (gt_mask > 0).astype(np.uint8)
+    gt_damage = (gt_mask == 2).astype(np.uint8)
+    
+    # Calculate IoU
+    building_intersection = np.logical_and(pred_building, gt_building).sum()
+    building_union = np.logical_or(pred_building, gt_building).sum()
+    metrics['building_iou'] = float(building_intersection) / float(building_union) if building_union > 0 else 0.0
+    
+    damage_intersection = np.logical_and(pred_damage, gt_damage).sum()
+    damage_union = np.logical_or(pred_damage, gt_damage).sum()
+    metrics['damage_iou'] = float(damage_intersection) / float(damage_union) if damage_union > 0 else 0.0
+    
+    # Calculate F1 scores
+    # Building F1
+    building_tp = building_intersection
+    building_fp = pred_building.sum() - building_tp
+    building_fn = gt_building.sum() - building_tp
+    building_precision = building_tp / (building_tp + building_fp) if (building_tp + building_fp) > 0 else 0.0
+    building_recall = building_tp / (building_tp + building_fn) if (building_tp + building_fn) > 0 else 0.0
+    metrics['building_f1'] = 2 * (building_precision * building_recall) / (building_precision + building_recall) if (building_precision + building_recall) > 0 else 0.0
+    
+    # Damage F1
+    damage_tp = damage_intersection
+    damage_fp = pred_damage.sum() - damage_tp
+    damage_fn = gt_damage.sum() - damage_tp
+    damage_precision = damage_tp / (damage_tp + damage_fp) if (damage_tp + damage_fp) > 0 else 0.0
+    damage_recall = damage_tp / (damage_tp + damage_fn) if (damage_tp + damage_fn) > 0 else 0.0
+    metrics['damage_f1'] = 2 * (damage_precision * damage_recall) / (damage_precision + damage_recall) if (damage_precision + damage_recall) > 0 else 0.0
+    
+    # Calculate AUROC
+    try:
+        # Flatten arrays for AUROC calculation
+        pred_building_flat = pred_building.flatten()
+        gt_building_flat = gt_building.flatten()
+        pred_damage_flat = pred_damage.flatten()
+        gt_damage_flat = gt_damage.flatten()
+        
+        # Building AUROC
+        if len(np.unique(gt_building_flat)) > 1:
+            metrics['building_auroc'] = roc_auc_score(gt_building_flat, pred_building_flat)
+        else:
+            metrics['building_auroc'] = 0.5
+        
+        # Damage AUROC
+        if len(np.unique(gt_damage_flat)) > 1:
+            metrics['damage_auroc'] = roc_auc_score(gt_damage_flat, pred_damage_flat)
+        else:
+            metrics['damage_auroc'] = 0.5
+            
+    except Exception as e:
+        print(f"Warning: Could not calculate AUROC: {e}")
+        metrics['building_auroc'] = 0.5
+        metrics['damage_auroc'] = 0.5
+    
+    # Add additional metrics
+    metrics['building_precision'] = building_precision
+    metrics['building_recall'] = building_recall
+    metrics['damage_precision'] = damage_precision
+    metrics['damage_recall'] = damage_recall
+    
+    # Calculate ratios
+    metrics['damage_ratio'] = float(pred_damage.sum()) / float(pred_mask_resized.size)
+    metrics['building_ratio'] = float(pred_building.sum()) / float(pred_mask_resized.size)
+    metrics['gt_damage_ratio'] = float(gt_damage.sum()) / float(gt_mask.size)
+    metrics['gt_building_ratio'] = float(gt_building.sum()) / float(gt_mask.size)
+    
+    return metrics
 def calculate_weighted_metrics(all_results):
     """Calculate weighted IoU, F1, and AUROC across all images based on image size"""
     
